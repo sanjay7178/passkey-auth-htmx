@@ -4,13 +4,14 @@ package main
 import (
 	"database/sql"
 	"encoding/binary"
-	log "github.com/sirupsen/logrus"
 	"net/http"
-    "github.com/sanjay7178/passkey-auth-htmx/session"
+	// "time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	_ "github.com/mattn/go-sqlite3"
+	log "github.com/sirupsen/logrus"
 )
 
 type User struct {
@@ -23,6 +24,11 @@ type Server struct {
     db       *sql.DB
     webauthn *webauthn.WebAuthn
 }
+
+// Temporary in-memory session store (replace with proper session management in production)
+var sessionStore = make(map[uint64]*webauthn.SessionData)
+// var sessionStore = NewSessionStore(5 * time.Minute)
+
 
 func main() {
     // Initialize SQLite database
@@ -55,7 +61,7 @@ func main() {
     web, err := webauthn.New(&webauthn.Config{
         RPDisplayName: "Passkey Demo",
         RPID:         "localhost",
-        RPOrigin:     "http://localhost:8080",
+        RPOrigins:     []string{"http://localhost:8080"},
     })
     if err != nil {
         log.Fatal(err)
@@ -315,7 +321,7 @@ func (s *Server) handleRegisterBegin(c *gin.Context) {
     }
 
     // Generate registration options
-    options, _, err := s.webauthn.BeginRegistration(
+    options, session, err := s.webauthn.BeginRegistration(
         &user,
         webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
             RequireResidentKey: BoolPtr(true),
@@ -329,7 +335,7 @@ func (s *Server) handleRegisterBegin(c *gin.Context) {
     }
 
     // Store session data (in production, use a proper session store)
-    // sessionStore[user.ID] = *session
+    sessionStore[user.ID] = session
 
     c.JSON(http.StatusOK, options)
 }
@@ -440,7 +446,7 @@ func (s *Server) handleLoginBegin(c *gin.Context) {
 func (s *Server) handleLoginFinish(c *gin.Context) {
     var params struct {
         Username string              `json:"username"`
-        Response *protocol.Response  `json:"response"`
+        Response *protocol.CredentialAssertionResponse  `json:"response"`
     }
     if err := c.BindJSON(&params); err != nil {
         c.String(http.StatusBadRequest, "Invalid request")
@@ -485,7 +491,7 @@ func (s *Server) handleLoginFinish(c *gin.Context) {
     delete(sessionStore, user.ID) // Clean up after ourselves
 
     // Verify login
-    credential, err := s.webauthn.FinishLogin(&user, session, params.Response)
+    credential, err := s.webauthn.FinishLogin(&user, *session, c.Request)
     if err != nil {
         log.WithError(err).Error("Failed to finish login")
         c.String(http.StatusUnauthorized, "Login failed")

@@ -1,5 +1,5 @@
 // session.go
-package session
+package main
 
 import (
     "sync"
