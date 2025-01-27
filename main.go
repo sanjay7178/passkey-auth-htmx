@@ -1,0 +1,421 @@
+// main.go
+package main
+
+import (
+	"database/sql"
+	"encoding/binary"
+	log "github.com/sirupsen/logrus"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"github.com/go-webauthn/webauthn/protocol"
+	"github.com/go-webauthn/webauthn/webauthn"
+	_ "github.com/mattn/go-sqlite3"
+)
+
+type User struct {
+    ID          uint64 `json:"id"`
+    Name        string `json:"name"`
+    Credentials []webauthn.Credential
+}
+
+type Server struct {
+    db       *sql.DB
+    webauthn *webauthn.WebAuthn
+}
+
+func main() {
+    // Initialize SQLite database
+    db, err := sql.Open("sqlite3", "passkeys.db")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    // Create tables
+    _, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS credentials (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            public_key BLOB,
+            attestation_type TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+    `)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Initialize WebAuthn
+    web, err := webauthn.New(&webauthn.Config{
+        RPDisplayName: "Passkey Demo",
+        RPID:         "localhost",
+        RPOrigins:    []string{"http://localhost:8080"},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    server := &Server{
+        db:       db,
+        webauthn: web,
+    }
+
+    // Initialize Gin
+    r := gin.Default()
+
+    // Serve static files
+    r.Static("/static", "./static")
+
+    // Routes
+    r.GET("/", server.handleHome)
+    
+    // Registration endpoints
+    r.POST("/register", server.handleRegister)
+    r.POST("/register/begin", server.handleRegisterBegin)
+    r.POST("/register/finish", server.handleRegisterFinish)
+    
+    // Login endpoints
+    r.POST("/login", server.handleLogin)
+    r.POST("/login/begin", server.handleLoginBegin)
+    r.POST("/login/finish", server.handleLoginFinish)
+    
+    // Delete endpoint
+    r.DELETE("/delete", server.handleDelete)
+
+    log.Println("Server running on http://localhost:8080")
+    r.Run(":8080")
+}
+
+func (s *Server) handleHome(c *gin.Context) {
+    html := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Passkey Demo</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+</head>
+<body>
+    <h1>Passkey Authentication Demo</h1>
+    
+    <div>
+        <h2>Register</h2>
+        <form hx-post="/register" hx-target="#message">
+            <input type="text" name="username" placeholder="Username" required>
+            <button type="submit">Register</button>
+        </form>
+    </div>
+
+    <div>
+        <h2>Login</h2>
+        <form hx-post="/login" hx-target="#message">
+            <input type="text" name="username" placeholder="Username" required>
+            <button type="submit">Login</button>
+        </form>
+    </div>
+
+    <div>
+        <h2>Delete Passkey</h2>
+        <form hx-delete="/delete" hx-target="#message">
+            <input type="text" name="username" placeholder="Username" required>
+            <button type="submit">Delete Passkey</button>
+        </form>
+    </div>
+
+    <div id="message"></div>
+
+    <script>
+        // Helper function to encode ArrayBuffer to base64
+        function bufferToBase64(buffer) {
+            return btoa(String.fromCharCode(...new Uint8Array(buffer)));
+        }
+
+        // Helper function to decode base64 to ArrayBuffer
+        function base64ToBuffer(base64) {
+            const binary = atob(base64);
+            const buffer = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                buffer[i] = binary.charCodeAt(i);
+            }
+            return buffer;
+        }
+
+        // Register functions
+        async function registerPasskey(username) {
+            try {
+                // Begin registration
+                const optionsResp = await fetch('/register/begin', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
+                const options = await optionsResp.json();
+
+                // Convert base64 challenge to ArrayBuffer
+                options.publicKey.challenge = base64ToBuffer(options.publicKey.challenge);
+                options.publicKey.user.id = base64ToBuffer(options.publicKey.user.id);
+
+                // Create credentials
+                const credential = await navigator.credentials.create({
+                    publicKey: options.publicKey
+                });
+
+                // Prepare credential data for server
+                const credentialData = {
+                    id: credential.id,
+                    rawId: bufferToBase64(credential.rawId),
+                    type: credential.type,
+                    response: {
+                        attestationObject: bufferToBase64(credential.response.attestationObject),
+                        clientDataJSON: bufferToBase64(credential.response.clientDataJSON)
+                    }
+                };
+
+                // Finish registration
+                const finishResp = await fetch('/register/finish', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(credentialData)
+                });
+
+                const result = await finishResp.text();
+                document.getElementById('message').innerHTML = result;
+            } catch (err) {
+                console.error('Registration error:', err);
+                document.getElementById('message').innerHTML = 'Registration failed: ' + err.message;
+            }
+        }
+
+        // Login functions
+        async function loginWithPasskey(username) {
+            try {
+                // Begin authentication
+                const optionsResp = await fetch('/login/begin', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
+                const options = await optionsResp.json();
+                console.log(options);
+                // Convert base64 challenge and allowCredentials to ArrayBuffer
+                options.publicKey.challenge = base64ToBuffer(options.publicKey.challenge);
+                if (options.publicKey.allowCredentials) {
+                    options.publicKey.allowCredentials = options.publicKey.allowCredentials.map(cred => ({
+                        ...cred,
+                        id: base64ToBuffer(cred.id)
+                    }));
+                }
+
+                // Get credentials
+                const credential = await navigator.credentials.get({
+                    publicKey: options.publicKey
+                });
+
+                // Prepare credential data for server
+                const credentialData = {
+                    id: credential.id,
+                    rawId: bufferToBase64(credential.rawId),
+                    type: credential.type,
+                    response: {
+                        authenticatorData: bufferToBase64(credential.response.authenticatorData),
+                        clientDataJSON: bufferToBase64(credential.response.clientDataJSON),
+                        signature: bufferToBase64(credential.response.signature),
+                        userHandle: credential.response.userHandle ? bufferToBase64(credential.response.userHandle) : null
+                    }
+                };
+
+                // Finish authentication
+                const finishResp = await fetch('/login/finish', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(credentialData)
+                });
+
+                const result = await finishResp.text();
+                document.getElementById('message').innerHTML = result;
+            } catch (err) {
+                console.error('Login error:', err);
+                document.getElementById('message').innerHTML = 'Login failed: ' + err.message;
+            }
+        }
+
+        // HTMX handlers
+        document.body.addEventListener('htmx:afterRequest', function(evt) {
+            if (evt.detail.pathInfo.requestPath === '/register') {
+                const username = evt.detail.elt.querySelector('input[name="username"]').value;
+                registerPasskey(username);
+            }
+            if (evt.detail.pathInfo.requestPath === '/login') {
+                const username = evt.detail.elt.querySelector('input[name="username"]').value;
+                alert('Login with passkey for user: ' + username);
+                loginWithPasskey(username);
+            }
+        });
+    </script>
+</body>
+</html>
+`
+    c.Header("Content-Type", "text/html")
+    c.String(http.StatusOK, html)
+}
+
+func (s *Server) handleRegister(c *gin.Context) {
+    username := c.PostForm("username")
+    if username == "" {
+        c.String(http.StatusBadRequest, "Username is required")
+        return
+    }
+
+    // Check if user exists
+    var exists bool
+    err := s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE name = ?)", username).Scan(&exists)
+    if err != nil {
+        c.String(http.StatusInternalServerError, "Database error")
+        return
+    }
+
+    if exists {
+        c.String(http.StatusOK, "User already exists")
+        return
+    }
+
+    // Create new user
+    result, err := s.db.Exec("INSERT INTO users (name) VALUES (?)", username)
+    if err != nil {
+        c.String(http.StatusInternalServerError, "Failed to create user")
+        return
+    }
+
+    id, _ := result.LastInsertId() 
+    c.String(http.StatusOK, "Starting registration for user: "+username, id)
+}
+
+func (s *Server) handleRegisterBegin(c *gin.Context) {
+    var data struct {
+        Username string `json:"username"`
+    }
+    if err := c.BindJSON(&data); err != nil {
+        c.String(http.StatusBadRequest, "Invalid request")
+        return
+    }
+
+    // Get user from database
+    var user User
+    err := s.db.QueryRow("SELECT id, name FROM users WHERE name = ?", data.Username).Scan(&user.ID, &user.Name)
+    if err != nil {
+        c.String(http.StatusNotFound, "User not found")
+        return
+    }
+
+    // Generate registration options
+    // options, session, err := s.webauthn.BeginRegistration(
+        options, _, err := s.webauthn.BeginRegistration(
+        &user,
+        webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
+            RequireResidentKey: BoolPtr(true),
+            //TODO: look at https://pkg.go.dev/github.com/go-webauthn/webauthn@v0.11.2/protocol#UserVerificationRequirement
+            UserVerification:   "required",
+        }),
+    )
+    if err != nil {
+        c.String(http.StatusInternalServerError, "Failed to begin registration")
+        return
+    }
+
+    // Store session data (in production, use a proper session store)
+    // sessionStore[user.ID] = *session
+
+    c.JSON(http.StatusOK, options)
+}
+
+func BoolPtr(b bool) *bool {
+    return &b
+}
+
+func (s *Server) handleRegisterFinish(c *gin.Context) {
+    var credential webauthn.Credential
+    if err := c.BindJSON(&credential); err != nil {
+        c.String(http.StatusBadRequest, "Invalid request")
+        return
+    }
+
+    // Get session data (in production, get from session store)
+    // session := sessionStore[userID]
+
+    // Verify and create credential
+    // _, err := s.webauthn.FinishRegistration(&user, session, credential)
+    // if err != nil {
+    //     c.String(http.StatusInternalServerError, "Failed to finish registration")
+    //     return
+    // }
+
+    // Store credential in database
+    // _, err = s.db.Exec(
+    //     "INSERT INTO credentials (id, user_id, public_key, attestation_type) VALUES (?, ?, ?, ?)",
+    //     credential.ID, user.ID, credential.PublicKey, credential.AttestationType,
+    // )
+    // if err != nil {
+    //     c.String(http.StatusInternalServerError, "Failed to store credential")
+    //     return
+    // }
+
+    c.String(http.StatusOK, "Registration successful")
+}
+
+// Login handlers would be implemented similarly
+func (s *Server) handleLogin(c *gin.Context) {
+    username := c.PostForm("username")
+    if username == "" {
+        c.String(http.StatusBadRequest, "Username is required")
+        return
+    }
+    // Implement login logic
+    c.String(http.StatusOK, "Starting login for user: "+username)
+}
+
+func (s *Server) handleLoginBegin(c *gin.Context) {
+    // Implement login begin logic
+    c.String(http.StatusOK, "Login begin")
+}
+
+func (s *Server) handleLoginFinish(c *gin.Context) {
+    // Implement login finish logic
+    c.String(http.StatusOK, "Login successful")
+}
+
+func (s *Server) handleDelete(c *gin.Context) {
+    username := c.PostForm("username")
+    if username == "" {
+        c.String(http.StatusBadRequest, "Username is required")
+        return
+    }
+    // Implement delete logic
+    c.String(http.StatusOK, "Passkey deleted for user: "+username)
+}
+
+// WebAuthn interface implementation
+func (u *User) WebAuthnID() []byte {
+    buf := make([]byte, 8)
+    binary.LittleEndian.PutUint64(buf, u.ID)
+    return buf
+}
+
+func (u *User) WebAuthnName() string {
+    return u.Name
+}
+
+func (u *User) WebAuthnDisplayName() string {
+    return u.Name
+}
+
+func (u *User) WebAuthnCredentials() []webauthn.Credential {
+    return u.Credentials
+}
+
+func (u *User) WebAuthnIcon() string {
+    return ""
+}
