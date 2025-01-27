@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	log "github.com/sirupsen/logrus"
 	"net/http"
-
+    "github.com/sanjay7178/passkey-auth-htmx/session"
 	"github.com/gin-gonic/gin"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -43,6 +43,7 @@ func main() {
             user_id INTEGER,
             public_key BLOB,
             attestation_type TEXT,
+            last_used TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
     `)
@@ -54,7 +55,7 @@ func main() {
     web, err := webauthn.New(&webauthn.Config{
         RPDisplayName: "Passkey Demo",
         RPID:         "localhost",
-        RPOrigins:    []string{"http://localhost:8080"},
+        RPOrigin:     "http://localhost:8080",
     })
     if err != nil {
         log.Fatal(err)
@@ -200,7 +201,7 @@ func (s *Server) handleHome(c *gin.Context) {
                     body: JSON.stringify({ username })
                 });
                 const options = await optionsResp.json();
-                console.log(options);
+
                 // Convert base64 challenge and allowCredentials to ArrayBuffer
                 options.publicKey.challenge = base64ToBuffer(options.publicKey.challenge);
                 if (options.publicKey.allowCredentials) {
@@ -217,14 +218,17 @@ func (s *Server) handleHome(c *gin.Context) {
 
                 // Prepare credential data for server
                 const credentialData = {
-                    id: credential.id,
-                    rawId: bufferToBase64(credential.rawId),
-                    type: credential.type,
+                    username: username,
                     response: {
-                        authenticatorData: bufferToBase64(credential.response.authenticatorData),
-                        clientDataJSON: bufferToBase64(credential.response.clientDataJSON),
-                        signature: bufferToBase64(credential.response.signature),
-                        userHandle: credential.response.userHandle ? bufferToBase64(credential.response.userHandle) : null
+                        id: credential.id,
+                        rawId: bufferToBase64(credential.rawId),
+                        type: credential.type,
+                        response: {
+                            authenticatorData: bufferToBase64(credential.response.authenticatorData),
+                            clientDataJSON: bufferToBase64(credential.response.clientDataJSON),
+                            signature: bufferToBase64(credential.response.signature),
+                            userHandle: credential.response.userHandle ? bufferToBase64(credential.response.userHandle) : null
+                        }
                     }
                 };
 
@@ -251,7 +255,6 @@ func (s *Server) handleHome(c *gin.Context) {
             }
             if (evt.detail.pathInfo.requestPath === '/login') {
                 const username = evt.detail.elt.querySelector('input[name="username"]').value;
-                alert('Login with passkey for user: ' + username);
                 loginWithPasskey(username);
             }
         });
@@ -290,8 +293,8 @@ func (s *Server) handleRegister(c *gin.Context) {
         return
     }
 
-    id, _ := result.LastInsertId() 
-    c.String(http.StatusOK, "Starting registration for user: "+username, id)
+    id, _ := result.LastInsertId()
+    c.String(http.StatusOK, "Starting registration for user: "+username , id)
 }
 
 func (s *Server) handleRegisterBegin(c *gin.Context) {
@@ -312,12 +315,11 @@ func (s *Server) handleRegisterBegin(c *gin.Context) {
     }
 
     // Generate registration options
-    // options, session, err := s.webauthn.BeginRegistration(
-        options, _, err := s.webauthn.BeginRegistration(
+    options, _, err := s.webauthn.BeginRegistration(
         &user,
         webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
             RequireResidentKey: BoolPtr(true),
-            //TODO: look at https://pkg.go.dev/github.com/go-webauthn/webauthn@v0.11.2/protocol#UserVerificationRequirement
+            // TODO: Add other options as needed
             UserVerification:   "required",
         }),
     )
@@ -335,6 +337,7 @@ func (s *Server) handleRegisterBegin(c *gin.Context) {
 func BoolPtr(b bool) *bool {
     return &b
 }
+
 
 func (s *Server) handleRegisterFinish(c *gin.Context) {
     var credential webauthn.Credential
@@ -378,12 +381,124 @@ func (s *Server) handleLogin(c *gin.Context) {
 }
 
 func (s *Server) handleLoginBegin(c *gin.Context) {
-    // Implement login begin logic
-    c.String(http.StatusOK, "Login begin")
+    var data struct {
+        Username string `json:"username"`
+    }
+    if err := c.BindJSON(&data); err != nil {
+        c.String(http.StatusBadRequest, "Invalid request")
+        return
+    }
+
+    // Get user from database
+    var user User
+    err := s.db.QueryRow("SELECT id, name FROM users WHERE name = ?", data.Username).Scan(&user.ID, &user.Name)
+    if err != nil {
+        if err == sql.ErrNoRows {
+            c.String(http.StatusNotFound, "User not found")
+            return
+        }
+        log.WithError(err).Error("Database error while fetching user")
+        c.String(http.StatusInternalServerError, "Database error")
+        return
+    }
+
+    // Load user's credentials from database
+    rows, err := s.db.Query("SELECT id, public_key, attestation_type FROM credentials WHERE user_id = ?", user.ID)
+    if err != nil {
+        log.WithError(err).Error("Database error while fetching credentials")
+        c.String(http.StatusInternalServerError, "Database error")
+        return
+    }
+    defer rows.Close()
+
+    user.Credentials = []webauthn.Credential{}
+    for rows.Next() {
+        var cred webauthn.Credential
+        err := rows.Scan(&cred.ID, &cred.PublicKey, &cred.AttestationType)
+        if err != nil {
+            log.WithError(err).Error("Error scanning credential row")
+            continue
+        }
+        user.Credentials = append(user.Credentials, cred)
+    }
+
+    // Begin login
+    options, session, err := s.webauthn.BeginLogin(&user)
+    if err != nil {
+        log.WithError(err).Error("Failed to begin login")
+        c.String(http.StatusInternalServerError, "Failed to begin login")
+        return
+    }
+
+    // In production, store session data in a proper session store
+    // For now, we'll store it in memory (not recommended for production)
+    sessionStore[user.ID] = session
+
+    c.JSON(http.StatusOK, options)
 }
 
 func (s *Server) handleLoginFinish(c *gin.Context) {
-    // Implement login finish logic
+    var params struct {
+        Username string              `json:"username"`
+        Response *protocol.Response  `json:"response"`
+    }
+    if err := c.BindJSON(&params); err != nil {
+        c.String(http.StatusBadRequest, "Invalid request")
+        return
+    }
+
+    // Get user from database
+    var user User
+    err := s.db.QueryRow("SELECT id, name FROM users WHERE name = ?", params.Username).Scan(&user.ID, &user.Name)
+    if err != nil {
+        if err == sql.ErrNoRows {
+            c.String(http.StatusNotFound, "User not found")
+            return
+        }
+        log.WithError(err).Error("Database error while fetching user")
+        c.String(http.StatusInternalServerError, "Database error")
+        return
+    }
+
+    // Load user's credentials
+    rows, err := s.db.Query("SELECT id, public_key, attestation_type FROM credentials WHERE user_id = ?", user.ID)
+    if err != nil {
+        log.WithError(err).Error("Database error while fetching credentials")
+        c.String(http.StatusInternalServerError, "Database error")
+        return
+    }
+    defer rows.Close()
+
+    user.Credentials = []webauthn.Credential{}
+    for rows.Next() {
+        var cred webauthn.Credential
+        err := rows.Scan(&cred.ID, &cred.PublicKey, &cred.AttestationType)
+        if err != nil {
+            log.WithError(err).Error("Error scanning credential row")
+            continue
+        }
+        user.Credentials = append(user.Credentials, cred)
+    }
+
+    // Get session data (in production, get from session store)
+    session := sessionStore[user.ID]
+    delete(sessionStore, user.ID) // Clean up after ourselves
+
+    // Verify login
+    credential, err := s.webauthn.FinishLogin(&user, session, params.Response)
+    if err != nil {
+        log.WithError(err).Error("Failed to finish login")
+        c.String(http.StatusUnauthorized, "Login failed")
+        return
+    }
+
+    // Update credential's last used time if needed
+    _, err = s.db.Exec("UPDATE credentials SET last_used = CURRENT_TIMESTAMP WHERE id = ?", credential.ID)
+    if err != nil {
+        log.WithError(err).Error("Failed to update credential last used time")
+        // Don't return error to client as login was successful
+    }
+
     c.String(http.StatusOK, "Login successful")
 }
 

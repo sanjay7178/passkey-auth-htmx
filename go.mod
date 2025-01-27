@@ -1,4 +1,4 @@
-module github.com/sanjay7178/passkey-auth
+module github.com/sanjay7178/passkey-auth-htmx
 
 go 1.23.5
 
