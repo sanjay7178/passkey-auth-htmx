@@ -4,14 +4,13 @@ package main
 import (
 	"database/sql"
 	"encoding/binary"
+	log "github.com/sirupsen/logrus"
 	"net/http"
-	// "time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	_ "github.com/mattn/go-sqlite3"
-	log "github.com/sirupsen/logrus"
 )
 
 type User struct {
@@ -24,11 +23,7 @@ type Server struct {
     db       *sql.DB
     webauthn *webauthn.WebAuthn
 }
-
-// Temporary in-memory session store (replace with proper session management in production)
-var sessionStore = make(map[uint64]*webauthn.SessionData)
-// var sessionStore = NewSessionStore(5 * time.Minute)
-
+var sessionStore = make(map[uint64]webauthn.SessionData)
 
 func main() {
     // Initialize SQLite database
@@ -49,7 +44,6 @@ func main() {
             user_id INTEGER,
             public_key BLOB,
             attestation_type TEXT,
-            last_used TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
     `)
@@ -61,7 +55,7 @@ func main() {
     web, err := webauthn.New(&webauthn.Config{
         RPDisplayName: "Passkey Demo",
         RPID:         "localhost",
-        RPOrigins:     []string{"http://localhost:8080"},
+        RPOrigins:    []string{"http://localhost:8080"},
     })
     if err != nil {
         log.Fatal(err)
@@ -138,23 +132,36 @@ func (s *Server) handleHome(c *gin.Context) {
     <script>
         // Helper function to encode ArrayBuffer to base64
         function bufferToBase64(buffer) {
-            return btoa(String.fromCharCode(...new Uint8Array(buffer)));
+            const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer)));
+            // Convert to base64URL by replacing characters that are different in base64URL encoding
+            return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
         }
 
         // Helper function to decode base64 to ArrayBuffer
-        function base64ToBuffer(base64) {
-            const binary = atob(base64);
-            const buffer = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) {
-                buffer[i] = binary.charCodeAt(i);
+        function base64ToBuffer(base64url) {
+            try {
+                // Convert base64URL to regular base64
+                const base64 = base64url.replace(/-/g, '+').replace(/_/g, '/');
+                // Add padding if needed
+                const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, '=');
+                const binary = atob(padded);
+                const buffer = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    buffer[i] = binary.charCodeAt(i);
+                }
+                return buffer;
+            } catch (err) {
+                console.error('Base64 decode error:', err);
+                throw new Error('Invalid base64 string');
             }
-            return buffer;
         }
 
         // Register functions
         async function registerPasskey(username) {
             try {
                 // Begin registration
+                console.log("registerPasskey");
+                console.log("username: "+username);
                 const optionsResp = await fetch('/register/begin', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -181,6 +188,7 @@ func (s *Server) handleHome(c *gin.Context) {
                         clientDataJSON: bufferToBase64(credential.response.clientDataJSON)
                     }
                 };
+                alert("credentialData: "+credentialData);
 
                 // Finish registration
                 const finishResp = await fetch('/register/finish', {
@@ -207,7 +215,7 @@ func (s *Server) handleHome(c *gin.Context) {
                     body: JSON.stringify({ username })
                 });
                 const options = await optionsResp.json();
-
+                console.log(options);
                 // Convert base64 challenge and allowCredentials to ArrayBuffer
                 options.publicKey.challenge = base64ToBuffer(options.publicKey.challenge);
                 if (options.publicKey.allowCredentials) {
@@ -224,17 +232,14 @@ func (s *Server) handleHome(c *gin.Context) {
 
                 // Prepare credential data for server
                 const credentialData = {
-                    username: username,
+                    id: credential.id,
+                    rawId: bufferToBase64(credential.rawId),
+                    type: credential.type,
                     response: {
-                        id: credential.id,
-                        rawId: bufferToBase64(credential.rawId),
-                        type: credential.type,
-                        response: {
-                            authenticatorData: bufferToBase64(credential.response.authenticatorData),
-                            clientDataJSON: bufferToBase64(credential.response.clientDataJSON),
-                            signature: bufferToBase64(credential.response.signature),
-                            userHandle: credential.response.userHandle ? bufferToBase64(credential.response.userHandle) : null
-                        }
+                        authenticatorData: bufferToBase64(credential.response.authenticatorData),
+                        clientDataJSON: bufferToBase64(credential.response.clientDataJSON),
+                        signature: bufferToBase64(credential.response.signature),
+                        userHandle: credential.response.userHandle ? bufferToBase64(credential.response.userHandle) : null
                     }
                 };
 
@@ -261,6 +266,7 @@ func (s *Server) handleHome(c *gin.Context) {
             }
             if (evt.detail.pathInfo.requestPath === '/login') {
                 const username = evt.detail.elt.querySelector('input[name="username"]').value;
+                alert('Login with passkey for user: ' + username);
                 loginWithPasskey(username);
             }
         });
@@ -284,11 +290,13 @@ func (s *Server) handleRegister(c *gin.Context) {
     err := s.db.QueryRow("SELECT EXISTS(SELECT 1 FROM users WHERE name = ?)", username).Scan(&exists)
     if err != nil {
         c.String(http.StatusInternalServerError, "Database error")
+        log.WithError(err).Error("Database error")
         return
     }
 
     if exists {
         c.String(http.StatusOK, "User already exists")
+        log.WithField("username", username).Info("User already exists")
         return
     }
 
@@ -296,11 +304,12 @@ func (s *Server) handleRegister(c *gin.Context) {
     result, err := s.db.Exec("INSERT INTO users (name) VALUES (?)", username)
     if err != nil {
         c.String(http.StatusInternalServerError, "Failed to create user")
+        log.WithError(err).Error("Failed to create user")
         return
     }
 
-    id, _ := result.LastInsertId()
-    c.String(http.StatusOK, "Starting registration for user: "+username , id)
+    id, _ := result.LastInsertId() 
+    c.String(http.StatusOK, "Starting registration for user: "+username, id)
 }
 
 func (s *Server) handleRegisterBegin(c *gin.Context) {
@@ -309,6 +318,7 @@ func (s *Server) handleRegisterBegin(c *gin.Context) {
     }
     if err := c.BindJSON(&data); err != nil {
         c.String(http.StatusBadRequest, "Invalid request")
+        log.WithError(err).Error("Invalid request")
         return
     }
 
@@ -317,25 +327,29 @@ func (s *Server) handleRegisterBegin(c *gin.Context) {
     err := s.db.QueryRow("SELECT id, name FROM users WHERE name = ?", data.Username).Scan(&user.ID, &user.Name)
     if err != nil {
         c.String(http.StatusNotFound, "User not found")
+        log.WithError(err).Error("User not found")
         return
     }
 
     // Generate registration options
-    options, session, err := s.webauthn.BeginRegistration(
+    // options, session, err := s.webauthn.BeginRegistration(
+        options, session, err := s.webauthn.BeginRegistration(
         &user,
         webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
             RequireResidentKey: BoolPtr(true),
-            // TODO: Add other options as needed
+            //TODO: look at https://pkg.go.dev/github.com/go-webauthn/webauthn@v0.11.2/protocol#UserVerificationRequirement
             UserVerification:   "required",
         }),
     )
     if err != nil {
         c.String(http.StatusInternalServerError, "Failed to begin registration")
+        log.WithError(err).Error("Failed to begin registration")
         return
     }
 
     // Store session data (in production, use a proper session store)
-    sessionStore[user.ID] = session
+    sessionStore[user.ID] = *session
+    log.Println("sessionStore: ", *session)
 
     c.JSON(http.StatusOK, options)
 }
@@ -343,7 +357,6 @@ func (s *Server) handleRegisterBegin(c *gin.Context) {
 func BoolPtr(b bool) *bool {
     return &b
 }
-
 
 func (s *Server) handleRegisterFinish(c *gin.Context) {
     var credential webauthn.Credential
@@ -353,24 +366,28 @@ func (s *Server) handleRegisterFinish(c *gin.Context) {
     }
 
     // Get session data (in production, get from session store)
-    // session := sessionStore[userID]
+    session := sessionStore[uint64(credential.ID[0])]
+    log.Println("sessionStore: ", session)
 
     // Verify and create credential
-    // _, err := s.webauthn.FinishRegistration(&user, session, credential)
-    // if err != nil {
-    //     c.String(http.StatusInternalServerError, "Failed to finish registration")
-    //     return
-    // }
+    var user User
+    _, err := s.webauthn.FinishRegistration(&user, session, c.Request)
+    if err != nil {
+        c.String(http.StatusInternalServerError, "Failed to finish registration")
+        log.WithError(err).Error("Failed to finish registration")
+        return
+    }
 
     // Store credential in database
-    // _, err = s.db.Exec(
-    //     "INSERT INTO credentials (id, user_id, public_key, attestation_type) VALUES (?, ?, ?, ?)",
-    //     credential.ID, user.ID, credential.PublicKey, credential.AttestationType,
-    // )
-    // if err != nil {
-    //     c.String(http.StatusInternalServerError, "Failed to store credential")
-    //     return
-    // }
+    _, err = s.db.Exec(
+        "INSERT INTO credentials (id, user_id, public_key, attestation_type) VALUES (?, ?, ?, ?)",
+        credential.ID, user.ID, credential.PublicKey, credential.AttestationType,
+    )
+    if err != nil {
+        c.String(http.StatusInternalServerError, "Failed to store credential")
+        log.WithError(err).Error("Failed to store credential")
+        return
+    }
 
     c.String(http.StatusOK, "Registration successful")
 }
@@ -390,10 +407,16 @@ func (s *Server) handleLoginBegin(c *gin.Context) {
     var data struct {
         Username string `json:"username"`
     }
+    log.Println("Login begin")
+
     if err := c.BindJSON(&data); err != nil {
         c.String(http.StatusBadRequest, "Invalid request")
+        log.WithError(err).Error("Invalid request")
+        // print request data json 
+        log.Println(data)
         return
     }
+    log.Printf("Login begin for user: %s", data.Username)
 
     // Get user from database
     var user User
@@ -438,10 +461,12 @@ func (s *Server) handleLoginBegin(c *gin.Context) {
 
     // In production, store session data in a proper session store
     // For now, we'll store it in memory (not recommended for production)
-    sessionStore[user.ID] = session
+    sessionStore[user.ID] = *session
 
     c.JSON(http.StatusOK, options)
 }
+
+
 
 func (s *Server) handleLoginFinish(c *gin.Context) {
     var params struct {
@@ -491,7 +516,7 @@ func (s *Server) handleLoginFinish(c *gin.Context) {
     delete(sessionStore, user.ID) // Clean up after ourselves
 
     // Verify login
-    credential, err := s.webauthn.FinishLogin(&user, *session, c.Request)
+    credential, err := s.webauthn.FinishLogin(&user, session, c.Request)
     if err != nil {
         log.WithError(err).Error("Failed to finish login")
         c.String(http.StatusUnauthorized, "Login failed")
