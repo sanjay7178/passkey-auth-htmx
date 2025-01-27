@@ -177,14 +177,46 @@ func (s *Server) handleHome(c *gin.Context) {
                 const credential = await navigator.credentials.create({
                     publicKey: options.publicKey
                 });
+                
+                console.log(JSON.stringify(options.publicKey, null, 2));
+                // debug attestation 
+                console.log("credential: "+credential);
+                console.log("credential.rawId: "+credential.rawId);
+                console.log("credential.response: "+credential.response);
+                console.log("credential.response.getPublicKey(): "+credential.response.getPublicKey());
+                console.log("credential.response.getAttestation(): "+credential.response.getAttestation());
+                console.log("credential.response.getTransports(): "+credential.response.getTransports());
+                console.log("credential.response.userPresent: "+credential.response.userPresent);
+                console.log("credential.response.userVerified: "+credential.response.userVerified);
+                console.log("credential.response.backupEligible: "+credential.response.backupEligible);
+                console.log("credential.response.backupState: "+credential.response.backupState);
+                console.log("credential.response.getAuthenticatorData().aaguid: "+credential.response.getAuthenticatorData().aaguid);
+                console.log("credential.response.getAuthenticatorData().signCount: "+credential.response.getAuthenticatorData().signCount);
+                console.log("credential.response.getAttestationObject(): "+credential.response.getAttestationObject());
+                console.log("credential.response.getAuthenticatorData(): "+credential.response.getAuthenticatorData());
+                console.log("credential.response.clientDataJSON: "+credential.response.clientDataJSON);
 
-                // Prepare credential data for server
+
+                // Modified credential data preparation to match server-side struct
                 const credentialData = {
-                    id: credential.id,
-                    rawId: bufferToBase64(credential.rawId),
-                    type: credential.type,
-                    response: {
-                        attestationObject: bufferToBase64(credential.response.attestationObject),
+                    id: bufferToBase64(credential.rawId),
+                    publicKey: bufferToBase64(credential.response.getPublicKey()),
+                    attestationType: credential.type,
+                    transport: credential.response.getTransports(),
+                    flags: {
+                        userPresent: credential.response.userPresent,
+                        userVerified: credential.response.userVerified,
+                        backupEligible: credential.response.backupEligible,
+                        backupState: credential.response.backupState
+                    },
+                    authenticator: {
+                        aaguid: bufferToBase64(credential.response.getAuthenticatorData().aaguid),
+                        signCount: credential.response.getAuthenticatorData().signCount
+                    },
+                    attestation: {
+                        fmt: credential.response.getAttestation(),
+                        attStmt: bufferToBase64(credential.response.getAttestationObject()),
+                        authData: bufferToBase64(credential.response.getAuthenticatorData()),
                         clientDataJSON: bufferToBase64(credential.response.clientDataJSON)
                     }
                 };
@@ -360,6 +392,7 @@ func BoolPtr(b bool) *bool {
 
 func (s *Server) handleRegisterFinish(c *gin.Context) {
     var credential webauthn.Credential
+    log.Println("Register is about to finish")
     if err := c.BindJSON(&credential); err != nil {
         c.String(http.StatusBadRequest, "Invalid request")
         return
